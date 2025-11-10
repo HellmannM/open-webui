@@ -608,10 +608,20 @@ class Pipe:
                 f' name="{bundle.display_name}"' if bundle.display_name else ""
             )
 
-            for chunk in bundle.chunks:
-                context_parts.append(
-                    f'<source id="{citation_id}"{name_fragment}>{chunk.text}</source>'
+            summary = bundle.display_name or bundle.key
+            summary = (summary or "").strip()
+            if not summary and bundle.chunks:
+                fallback = (
+                    bundle.chunks[0].metadata.get("title")
+                    or bundle.chunks[0].metadata.get("name")
+                    or bundle.chunks[0].metadata.get("source")
+                    or ""
                 )
+                summary = fallback.strip()
+
+            context_parts.append(
+                f'<source id="{citation_id}"{name_fragment}>{summary}</source>'
+            )
 
         return "\n".join(context_parts).strip(), citation_map
 
@@ -787,9 +797,16 @@ class Pipe:
             name = bundle.display_name or bundle.key
             lines.append(f"{doc_idx}. {name}")
             for chunk_idx, chunk in enumerate(bundle.chunks[:max_chunks], 1):
-                preview = chunk.text.strip().replace("\n", " ")
-                if len(preview) > 220:
-                    preview = preview[:217] + "..."
+                label = (
+                    chunk.metadata.get("title")
+                    or chunk.metadata.get("name")
+                    or chunk.metadata.get("source")
+                    or chunk.metadata.get("category")
+                    or chunk.text
+                )
+                preview = (label or "").strip().replace("\n", " ")
+                if len(preview) > 160:
+                    preview = preview[:157] + "..."
                 lines.append(f"    - Chunk {chunk_idx}: {preview}")
             omitted = max(0, len(bundle.chunks) - max_chunks)
             if omitted:
