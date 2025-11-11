@@ -1,7 +1,7 @@
 """
 title: Kika RAG Open WebUI Pipeline
 author: Matthias Hellmann
-version: 1.0
+version: 3.0
 """
 
 from __future__ import annotations
@@ -10,44 +10,32 @@ import copy
 import json
 import logging
 import time
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, StreamingResponse
 
-from open_webui.models.users import Users, UserModel
-from open_webui.routers.tasks import generate_queries
+from open_webui.config import DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE
+from open_webui.constants import TASKS
 from open_webui.models.models import Models
-from open_webui.utils.chat import generate_chat_completion
-from open_webui.utils.misc import add_or_update_user_message, get_last_user_message
-from open_webui.utils.task import rag_template
+from open_webui.models.users import Users, UserModel
+from open_webui.models.functions import Functions
+from open_webui.routers.pipelines import process_pipeline_inlet_filter
 from open_webui.retrieval.utils import get_sources_from_items
 from open_webui.utils import middleware as _ow_middleware
+from open_webui.utils.chat import generate_chat_completion
+from open_webui.utils.misc import add_or_update_user_message, get_last_user_message
+from open_webui.utils.task import (
+    get_task_model_id,
+    query_generation_template,
+    rag_template,
+)
 
-PIPELINE_ID = "kikarag"
+PIPELINE_ID = "kikapipe_base"
 
 logger = logging.getLogger(__name__)
-
-
-def _should_skip_default_rag(request, model_id: Optional[str]) -> bool:
-    if not model_id:
-        return False
-
-    models = getattr(request.app.state, "MODELS", {}) or {}
-    model_entry = models.get(model_id) or {}
-
-    if model_id == PIPELINE_ID or model_entry.get("id") == PIPELINE_ID:
-        return True
-
-    info_blob = model_entry.get("info") or {}
-    base_model_id = (
-        model_entry.get("base_model_id")
-        or info_blob.get("base_model_id")
-        or info_blob.get("meta", {}).get("base_model_id")
-    )
-    return base_model_id == PIPELINE_ID
 
 
 if not getattr(_ow_middleware, "_kika_patch_installed", False):
@@ -57,7 +45,14 @@ if not getattr(_ow_middleware, "_kika_patch_installed", False):
 
     async def _kika_chat_completion_files_handler(request, body, extra_params, user):
         try:
-            if _should_skip_default_rag(request, body.get("model")):
+            metadata = body.get("metadata") if isinstance(body, dict) else None
+            custom_rag = (metadata or {}).get("custom_rag") or {}
+            model_id = body.get("model") if isinstance(body, dict) else None
+            model_prefix = (
+                model_id.split(".", 1)[0] if isinstance(model_id, str) else None
+            )
+
+            if custom_rag.get("handled") or model_prefix == PIPELINE_ID:
                 return body, {"sources": []}
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(
@@ -69,9 +64,7 @@ if not getattr(_ow_middleware, "_kika_patch_installed", False):
             request, body, extra_params, user
         )
 
-    _ow_middleware.chat_completion_files_handler = (
-        _kika_chat_completion_files_handler
-    )
+    _ow_middleware.chat_completion_files_handler = _kika_chat_completion_files_handler
     _ow_middleware._kika_patch_installed = True
     _ow_middleware._kika_original_chat_completion_files_handler = (
         _original_chat_completion_files_handler
@@ -98,7 +91,7 @@ class CustomRagResult:
     query: str
     sources: List[Dict[str, Any]]
     bundles: List[DocumentBundle]
-    settings_snapshot: Dict[str, Any]
+    stats: Dict[str, Any]
     queries: List[str]
     debug_mode: str
     debug_summary: Optional[str]
@@ -163,51 +156,6 @@ class Pipe:
                 "When true, force full-context retrieval for any attached collection."
             ),
         )
-        max_chunks_per_document: Optional[int] = Field(
-            default=None,
-            description=(
-                "Limit the number of chunks pulled from any single document."
-            ),
-        )
-        doc_type_allowlist: Optional[List[str]] = Field(
-            default=None,
-            description=(
-                "Only include chunks whose metadata doc_type/document_type matches one "
-                "of the supplied values."
-            ),
-        )
-        doc_type_blocklist: Optional[List[str]] = Field(
-            default=None,
-            description="Exclude chunks whose metadata matches any of these doc types.",
-        )
-        collection_allowlist: Optional[List[str]] = Field(
-            default=None,
-            description=(
-                "Restrict retrieval to the specified collection identifiers "
-                "(matches against collection_name, collection_names and id)."
-            ),
-        )
-        collection_blocklist: Optional[List[str]] = Field(
-            default=None,
-            description=(
-                "Skip retrieval for any attachment whose collection identifiers match "
-                "the supplied values."
-            ),
-        )
-        metadata_includes: Optional[Dict[str, List[str]]] = Field(
-            default=None,
-            description=(
-                "Per-metadata filters applied after retrieval. Each key maps to a list "
-                "of acceptable values; values are compared case-insensitively."
-            ),
-        )
-        metadata_excludes: Optional[Dict[str, List[str]]] = Field(
-            default=None,
-            description=(
-                "Inverse of metadata_includes; any chunk matching one of the provided "
-                "values for a key is discarded."
-            ),
-        )
         debug_mode: Optional[str] = Field(
             default="off",
             description=(
@@ -216,7 +164,6 @@ class Pipe:
                 "when 'log', it writes the summary to the server logs."
             ),
         )
-        pass
 
     class UserValves(BaseModel):
         model_id: Optional[str] = Field(
@@ -231,27 +178,19 @@ class Pipe:
         relevance_threshold: Optional[float] = None
         hybrid_search: Optional[bool] = None
         full_context: Optional[bool] = None
-        max_chunks_per_document: Optional[int] = None
-        doc_type_allowlist: Optional[List[str]] = None
-        doc_type_blocklist: Optional[List[str]] = None
-        collection_allowlist: Optional[List[str]] = None
-        collection_blocklist: Optional[List[str]] = None
-        metadata_includes: Optional[Dict[str, List[str]]] = None
-        metadata_excludes: Optional[Dict[str, List[str]]] = None
         debug_mode: Optional[str] = None
-        pass
 
     def __init__(self) -> None:
         self.id = PIPELINE_ID
         self.name = "Kika RAG Open WebUI Pipeline"
-        self.description = (
-            "Custom RAG enabled pipeline."
-        )
+        self.description = "Custom RAG enabled pipeline."
         self.type = "pipe"
         self.valves = self.Valves()
         logger.debug("Pipeline %s initialised", self.id)
 
-    def _extract_user_valves(self, user_payload: Optional[dict]) -> Optional["Pipe.UserValves"]:
+    def _extract_user_valves(
+        self, user_payload: Optional[dict]
+    ) -> Optional["Pipe.UserValves"]:
         if not user_payload:
             return None
         raw = user_payload.get("valves")
@@ -272,28 +211,6 @@ class Pipe:
                 if value is not None:
                     base[key] = value
         return base
-
-    @staticmethod
-    def _normalise_value(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            lowered = value.strip().lower()
-            return lowered or None
-        try:
-            lowered = str(value).strip().lower()
-            return lowered or None
-        except Exception:
-            return None
-
-    def _normalise_list(self, values: Optional[Sequence[Any]]) -> set:
-        if not values:
-            return set()
-        return {
-            normalised
-            for value in values
-            if (normalised := self._normalise_value(value)) is not None
-        }
 
     def _extract_query_and_context(
         self, messages: Sequence[Dict[str, Any]]
@@ -337,181 +254,39 @@ class Pipe:
 
         return None, None
 
-    def _extract_collection_names(self, item: Dict[str, Any]) -> set:
-        names = set()
-        if not isinstance(item, dict):
-            return names
-
-        direct_fields = (
-            "collection_name",
-            "collection_names",
-            "id",
-            "collection",
-        )
-
-        for field in direct_fields:
-            value = item.get(field)
-            if isinstance(value, str):
-                names.add(value)
-            elif isinstance(value, (list, tuple, set)):
-                for entry in value:
-                    if isinstance(entry, str):
-                        names.add(entry)
-
-        # Legacy knowledge attachments may store ids under "name"
-        potential_names = (
-            item.get("name"),
-            item.get("collection_id"),
-            item.get("file_id"),
-        )
-        for value in potential_names:
-            if isinstance(value, str):
-                names.add(value)
-
-        return {
-            normalised
-            for normalised in (self._normalise_value(name) for name in names)
-            if normalised is not None
-        }
-
-    def _filter_items_by_collection(
-        self,
-        items: List[Dict[str, Any]],
-        settings: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        allow = self._normalise_list(settings.get("collection_allowlist"))
-        block = self._normalise_list(settings.get("collection_blocklist"))
-
-        if not allow and not block:
-            return items
-
-        filtered: List[Dict[str, Any]] = []
-        for item in items:
-            names = self._extract_collection_names(item)
-
-            if allow and not (names & allow):
-                continue
-            if block and (names & block):
-                continue
-            filtered.append(item)
-
-        return filtered
-
-    def _metadata_matches_filters(
-        self,
-        metadata: Dict[str, Any],
-        settings: Dict[str, Any],
-    ) -> bool:
-        includes_cfg = settings.get("metadata_includes") or {}
-        excludes_cfg = settings.get("metadata_excludes") or {}
-
-        def to_normalised_set(value: Any) -> set:
-            if isinstance(value, (list, tuple, set)):
-                return {
-                    normalised
-                    for normalised in (
-                        self._normalise_value(entry) for entry in value
-                    )
-                    if normalised is not None
-                }
-            result = self._normalise_value(value)
-            return {result} if result is not None else set()
-
-        for key, values in includes_cfg.items():
-            acceptable = self._normalise_list(values)
-            if not acceptable:
-                continue
-            meta_values = to_normalised_set(metadata.get(key))
-            if not meta_values & acceptable:
-                return False
-
-        for key, values in excludes_cfg.items():
-            blocked = self._normalise_list(values)
-            if not blocked:
-                continue
-            meta_values = to_normalised_set(metadata.get(key))
-            if meta_values & blocked:
-                return False
-
-        return True
-
-    def _filter_sources(
+    def _bundle_sources(
         self,
         raw_sources: Sequence[Dict[str, Any]],
-        settings: Dict[str, Any],
     ) -> tuple[List[DocumentBundle], List[Dict[str, Any]], Dict[str, Any]]:
         if not raw_sources:
-            return [], [], {}
-
-        allow_types = self._normalise_list(settings.get("doc_type_allowlist"))
-        block_types = self._normalise_list(settings.get("doc_type_blocklist"))
-        allow_collections = self._normalise_list(settings.get("collection_allowlist"))
-        block_collections = self._normalise_list(settings.get("collection_blocklist"))
-        max_chunks = settings.get("max_chunks_per_document")
-        if isinstance(max_chunks, int) and max_chunks <= 0:
-            max_chunks = None
+            return (
+                [],
+                [],
+                {
+                    "raw_documents": 0,
+                    "raw_chunks": 0,
+                    "context_documents": 0,
+                    "context_chunks": 0,
+                },
+            )
 
         bundles: "OrderedDict[str, DocumentBundle]" = OrderedDict()
-        chunk_counter: Dict[str, int] = defaultdict(int)
+        raw_chunk_count = 0
 
         for source in raw_sources:
             documents = source.get("document") or []
             metadatas = source.get("metadata") or []
             distances = source.get("distances") or []
 
-            # Normalise distances to a flat list to align with document indices
             if distances and isinstance(distances[0], list):
                 distances = distances[0]
             if not isinstance(distances, list):
                 distances = list(distances) if distances else []
 
-            for idx, (document_text, metadata) in enumerate(
-                zip(documents, metadatas)
-            ):
+            raw_chunk_count += len(documents)
+
+            for idx, (document_text, metadata) in enumerate(zip(documents, metadatas)):
                 metadata = metadata or {}
-
-                raw_collection_candidates: List[Any] = []
-                raw_collection_candidates.extend(
-                    metadata.get("collection_names", []) if isinstance(metadata.get("collection_names"), (list, tuple, set)) else []
-                )
-                for key in (
-                    "collection_name",
-                    "collection_id",
-                    "collection",
-                    "id",
-                    "source",
-                ):
-                    raw_collection_candidates.append(metadata.get(key))
-
-                if isinstance(source, dict):
-                    src_info = source.get("source") or {}
-                    raw_collection_candidates.extend(
-                        src_info.get("collection_names", [])
-                        if isinstance(src_info.get("collection_names"), (list, tuple, set))
-                        else []
-                    )
-                    for key in ("collection_name", "id", "source"):
-                        raw_collection_candidates.append(src_info.get(key))
-
-                collection_names = self._normalise_list(raw_collection_candidates)
-                if allow_collections and not (collection_names & allow_collections):
-                    continue
-                if block_collections and (collection_names & block_collections):
-                    continue
-
-                doc_type = (
-                    metadata.get("doc_type")
-                    or metadata.get("document_type")
-                    or metadata.get("type")
-                )
-                doc_type_norm = self._normalise_value(doc_type)
-
-                if allow_types and doc_type_norm not in allow_types:
-                    continue
-                if block_types and doc_type_norm in block_types:
-                    continue
-                if not self._metadata_matches_filters(metadata, settings):
-                    continue
 
                 doc_key = (
                     metadata.get("source")
@@ -524,11 +299,6 @@ class Pipe:
                 )
                 doc_key = str(doc_key)
 
-                if max_chunks and chunk_counter[doc_key] >= max_chunks:
-                    continue
-
-                chunk_counter[doc_key] += 1
-
                 bundle = bundles.get(doc_key)
                 if not bundle:
                     display_name = (
@@ -537,10 +307,6 @@ class Pipe:
                         or (source.get("source") or {}).get("name")
                         or doc_key
                     )
-                else:
-                    display_name = bundle.display_name
-
-                if not bundle:
                     bundle = DocumentBundle(
                         key=doc_key,
                         display_name=display_name,
@@ -557,7 +323,9 @@ class Pipe:
                     RetrievedChunk(
                         text=document_text,
                         metadata=metadata,
-                        distance=distance if isinstance(distance, (int, float)) else None,
+                        distance=(
+                            distance if isinstance(distance, (int, float)) else None
+                        ),
                     )
                 )
 
@@ -568,25 +336,19 @@ class Pipe:
                 "document": [chunk.text for chunk in bundle.chunks],
                 "metadata": [chunk.metadata for chunk in bundle.chunks],
             }
-            distances = [chunk.distance for chunk in bundle.chunks if chunk.distance is not None]
+            distances = [
+                chunk.distance for chunk in bundle.chunks if chunk.distance is not None
+            ]
             if distances:
                 payload["distances"] = distances
             ui_sources.append(payload)
 
         stats = {
-            "total_documents": len(bundles),
-            "total_chunks": sum(len(bundle.chunks) for bundle in bundles.values()),
+            "raw_documents": len(bundles),
+            "raw_chunks": raw_chunk_count,
+            "context_documents": len(bundles),
+            "context_chunks": sum(len(bundle.chunks) for bundle in bundles.values()),
         }
-        if max_chunks is not None:
-            stats["max_chunks_per_document"] = max_chunks
-        if allow_types:
-            stats["doc_type_allowlist"] = sorted(allow_types)
-        if block_types:
-            stats["doc_type_blocklist"] = sorted(block_types)
-        if allow_collections:
-            stats["collection_allowlist"] = sorted(allow_collections)
-        if block_collections:
-            stats["collection_blocklist"] = sorted(block_collections)
 
         return list(bundles.values()), ui_sources, stats
 
@@ -653,16 +415,7 @@ class Pipe:
         return list(unique.values())
 
     @staticmethod
-    def _normalise_model_meta(meta: Any) -> Dict[str, Any]:
-        if meta is None:
-            return {}
-        if hasattr(meta, "model_dump"):
-            return meta.model_dump()
-        if isinstance(meta, dict):
-            return meta
-        return {}
-
-    def _convert_knowledge_items(self, items: Any) -> List[Dict[str, Any]]:
+    def _convert_knowledge_items(items: Any) -> List[Dict[str, Any]]:
         if not isinstance(items, list):
             return []
 
@@ -691,24 +444,62 @@ class Pipe:
                 converted.append(item)
         return converted
 
-    def _extract_model_knowledge(self, model_blob: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _extract_model_knowledge(
+        self, model_blob: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         if not isinstance(model_blob, dict):
             return []
         info = model_blob.get("info") or {}
-        meta = self._normalise_model_meta(info.get("meta"))
-        return self._convert_knowledge_items(meta.get("knowledge"))
+        meta = info.get("meta") or {}
+        knowledge = meta.get("knowledge")
+        if knowledge is None and "knowledge" in model_blob:
+            knowledge = model_blob.get("knowledge")
+        return self._convert_knowledge_items(knowledge)
 
     def _load_model_knowledge(self, model_id: Optional[str]) -> List[Dict[str, Any]]:
-        if not model_id:
+        if not isinstance(model_id, str) or not model_id:
             return []
         try:
             model_record = Models.get_model_by_id(model_id)
         except Exception:
-            model_record = None
+            return []
         if not model_record:
             return []
-        meta_dict = self._normalise_model_meta(getattr(model_record, "meta", None))
-        return self._convert_knowledge_items(meta_dict.get("knowledge"))
+
+        # model_record.meta might be a dict or Pydantic model
+        meta_obj = getattr(model_record, "meta", None)
+        if hasattr(meta_obj, "model_dump"):
+            meta_dict = meta_obj.model_dump()
+        elif isinstance(meta_obj, dict):
+            meta_dict = meta_obj
+        else:
+            meta_dict = {}
+
+        knowledge = meta_dict.get("knowledge")
+        return self._convert_knowledge_items(knowledge)
+
+    def _load_function_knowledge(
+        self, function_id: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(function_id, str) or not function_id:
+            return []
+        try:
+            function_record = Functions.get_function_by_id(function_id)
+        except Exception:
+            return []
+        if not function_record:
+            return []
+
+        meta_obj = getattr(function_record, "meta", None)
+        if hasattr(meta_obj, "model_dump"):
+            meta_dict = meta_obj.model_dump()
+        elif isinstance(meta_obj, dict):
+            meta_dict = meta_obj
+        else:
+            meta_dict = {}
+
+        knowledge = meta_dict.get("knowledge")
+        return self._convert_knowledge_items(knowledge)
 
     def _gather_files(
         self,
@@ -716,43 +507,87 @@ class Pipe:
         form_data: Dict[str, Any],
         selected_model_id: Optional[str],
         model_entry: Optional[Dict[str, Any]],
+        base_model_id: Optional[str],
+        external_files: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[List[Dict[str, Any]], List[str]]:
         files: List[Dict[str, Any]] = []
-        candidate_ids: set[str] = set()
+        seen_collections: set[str] = set()
+        seen_file_ids: set[str] = set()
 
-        def consider_model_id(value: Optional[str]) -> None:
+        def extend_items(
+            origin: str, candidate_files: Optional[Sequence[Dict[str, Any]]]
+        ):
+            if isinstance(candidate_files, list) and candidate_files:
+                logger.debug(
+                    "Custom RAG: adding %s file entries from %s",
+                    len(candidate_files),
+                    origin,
+                )
+                files.extend(candidate_files)
+
+        extend_items("external", external_files)
+        extend_items("metadata", metadata.get("files"))
+        extend_items("form_data", form_data.get("files"))
+
+        def extend_knowledge(items: List[Dict[str, Any]]) -> None:
+            for entry in items:
+                if entry.get("type") == "collection":
+                    identifier = entry.get("id") or entry.get("collection_name")
+                    if identifier and identifier in seen_collections:
+                        continue
+                    if identifier:
+                        seen_collections.add(identifier)
+                if entry.get("type") == "file":
+                    identifier = entry.get("id")
+                    if identifier and identifier in seen_file_ids:
+                        continue
+                    if identifier:
+                        seen_file_ids.add(identifier)
+                files.append(entry)
+
+        if isinstance(model_entry, dict):
+            extend_knowledge(self._extract_model_knowledge(model_entry))
+
+        metadata_model = metadata.get("model")
+        if isinstance(metadata_model, dict):
+            extend_knowledge(self._extract_model_knowledge(metadata_model))
+        elif isinstance(metadata_model, str):
+            extend_knowledge(self._load_model_knowledge(metadata_model))
+
+        function_ids: set[str] = set()
+        if isinstance(selected_model_id, str) and selected_model_id:
+            function_ids.add(selected_model_id.split(".", 1)[0])
+        function_ids.add(self.id)
+
+        for function_id in function_ids:
+            extend_knowledge(self._load_function_knowledge(function_id))
+
+        candidate_ids: set[str] = set()
+        if isinstance(selected_model_id, str) and selected_model_id:
+            candidate_ids.add(selected_model_id.split(".", 1)[0])
+        if isinstance(base_model_id, str) and base_model_id:
+            candidate_ids.add(base_model_id)
+        if isinstance(model_entry, dict):
+            base_id = model_entry.get("base_model_id")
+            if isinstance(base_id, str) and base_id:
+                candidate_ids.add(base_id)
+        for key in ("model", "model_id", "base_model_id", "target_model_id"):
+            value = metadata.get(key)
             if isinstance(value, str) and value:
                 candidate_ids.add(value)
 
-        meta_files = metadata.get("files")
-        if isinstance(meta_files, list):
-            files.extend(meta_files)
+        for candidate_id in candidate_ids:
+            extend_knowledge(self._load_model_knowledge(candidate_id))
 
-        body_files = form_data.get("files")
-        if isinstance(body_files, list):
-            files.extend(body_files)
-
-        files.extend(self._extract_model_knowledge(model_entry))
-        if isinstance(model_entry, dict):
-            consider_model_id(model_entry.get("id"))
-            consider_model_id(model_entry.get("base_model_id"))
-
-        consider_model_id(selected_model_id)
-        if selected_model_id:
-            files.extend(self._load_model_knowledge(selected_model_id))
-
-        for key in ("model", "model_id", "base_model_id", "target_model_id"):
-            consider_model_id(metadata.get(key))
-
-        for extra_id in list(candidate_ids):
-            if extra_id in (selected_model_id, self.id):
-                continue
-            files.extend(self._load_model_knowledge(extra_id))
-
-        consider_model_id(self.id)
-        files.extend(self._load_model_knowledge(self.id))
-
-        return self._deduplicate_files(files), sorted(candidate_ids)
+        deduped = self._deduplicate_files(files)
+        logger.debug(
+            "Custom RAG: gathered %s unique file/collection entries (selected_model=%s, base_model=%s, external=%s)",
+            len(deduped),
+            selected_model_id,
+            base_model_id,
+            len(external_files or []),
+        )
+        return deduped, []
 
     def _normalise_debug_mode(self, settings: Dict[str, Any]) -> str:
         value = settings.get("debug_mode")
@@ -762,6 +597,45 @@ class Pipe:
         if mode in {"chat", "log"}:
             return mode
         return "off"
+
+    def _is_pipeline_model(
+        self, models: Dict[str, Any], model_id: Optional[str]
+    ) -> bool:
+        if not model_id or model_id not in models:
+            return False
+        entry = models.get(model_id) or {}
+        if model_id == self.id:
+            return True
+        if entry.get("pipe"):
+            return True
+        pipeline_blob = entry.get("pipeline") or {}
+        return pipeline_blob.get("type") == "pipe"
+
+    def _resolve_query_model_id(
+        self,
+        preferred_id: Optional[str],
+        fallback_id: Optional[str],
+        models: Dict[str, Any],
+    ) -> Optional[str]:
+        for candidate in (preferred_id, fallback_id):
+            if (
+                isinstance(candidate, str)
+                and candidate in models
+                and not self._is_pipeline_model(models, candidate)
+            ):
+                return candidate
+
+        for model_id, entry in models.items():
+            if not self._is_pipeline_model(models, model_id):
+                return model_id
+
+        return None
+
+    @staticmethod
+    def _bounded_neighbor_count(value: Optional[int], default: int) -> int:
+        if isinstance(value, int) and value > 0:
+            return min(value, default)
+        return default
 
     def _format_debug_summary(
         self,
@@ -780,9 +654,13 @@ class Pipe:
         else:
             lines.append(f"Generated queries: {queries[0]}")
 
-        lines.append(
-            f"Documents: {stats.get('total_documents', 0)} | Chunks: {stats.get('total_chunks', 0)}"
-        )
+        raw_docs = stats.get("raw_documents", 0)
+        raw_chunks = stats.get("raw_chunks", 0)
+        ctx_docs = stats.get("context_documents", raw_docs)
+        ctx_chunks = stats.get("context_chunks", raw_chunks)
+        lines.append(f"Retrieved docs: {raw_docs} | chunks: {raw_chunks}")
+        if raw_docs != ctx_docs or raw_chunks != ctx_chunks:
+            lines.append(f"Context docs: {ctx_docs} | chunks: {ctx_chunks}")
         candidate_models = stats.get("candidate_model_ids") or []
         if candidate_models:
             lines.append("Candidate model IDs:")
@@ -828,16 +706,70 @@ class Pipe:
         if not config or not getattr(config, "ENABLE_RETRIEVAL_QUERY_GENERATION", True):
             return [default_query]
 
+        base_model_id = form_data.get("model")
+        models = getattr(request.app.state, "MODELS", {}) or {}
+        if not isinstance(base_model_id, str) or base_model_id not in models:
+            return [default_query]
+
+        preferred_task_model = get_task_model_id(
+            base_model_id,
+            getattr(config, "TASK_MODEL", None),
+            getattr(config, "TASK_MODEL_EXTERNAL", None),
+            models,
+        )
+
+        task_model_id = self._resolve_query_model_id(
+            preferred_task_model,
+            base_model_id,
+            models,
+        )
+        if not task_model_id:
+            return [default_query]
+
+        template = getattr(config, "QUERY_GENERATION_PROMPT_TEMPLATE", "")
+        if not isinstance(template, str) or not template.strip():
+            template = DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE
+
+        content = query_generation_template(
+            template,
+            form_data.get("messages", []),
+            user_model,
+        )
+
+        metadata_snapshot = (
+            request.state.metadata if hasattr(request.state, "metadata") else {}
+        )
         payload = {
-            "model": form_data.get("model"),
-            "messages": form_data.get("messages", []),
-            "type": "retrieval",
+            "model": task_model_id,
+            "messages": [{"role": "user", "content": content}],
+            "stream": False,
+            "metadata": {
+                **metadata_snapshot,
+                "task": str(TASKS.QUERY_GENERATION),
+                "task_body": form_data,
+                "chat_id": form_data.get("chat_id", None),
+            },
         }
 
         try:
-            response = await generate_queries(request, payload, user=user_model)
+            payload = await process_pipeline_inlet_filter(
+                request,
+                payload,
+                user_model,
+                models,
+            )
         except Exception as exc:
-            logger.debug("Query generation failed; falling back to prompt: %s", exc)
+            logger.debug("Query generation inlet filter failed: %s", exc)
+
+        try:
+            response = await generate_chat_completion(
+                request,
+                form_data=payload,
+                user=user_model,
+                bypass_filter=True,
+            )
+        except Exception as exc:
+            logger.debug("Query generation failed; using prompt directly: %s", exc)
             return [default_query]
 
         if isinstance(response, JSONResponse):
@@ -859,11 +791,8 @@ class Pipe:
 
         message = choices[0].get("message") or {}
         content = (
-            message.get("content")
-            or message.get("reasoning_content")
-            or ""
-        )
-        content = content.strip()
+            message.get("content") or message.get("reasoning_content") or ""
+        ).strip()
         if not content:
             return [default_query]
 
@@ -896,20 +825,37 @@ class Pipe:
         user_payload: Optional[dict],
         selected_model_id: Optional[str],
         model_entry: Optional[Dict[str, Any]],
+        base_model_id: Optional[str],
+        external_files: Optional[List[Dict[str, Any]]],
     ) -> Optional[CustomRagResult]:
         metadata = copy.deepcopy(form_data.get("metadata") or {})
         existing_sources = copy.deepcopy(metadata.get("sources") or [])
+        logger.debug(
+            "Custom RAG: starting gather (selected_model=%s, base_model=%s, external_files=%s)",
+            selected_model_id,
+            base_model_id,
+            len(external_files or []),
+        )
         files, candidate_model_ids = self._gather_files(
             metadata,
             form_data,
             selected_model_id,
             model_entry,
+            base_model_id,
+            external_files,
+        )
+        logger.debug(
+            "Custom RAG: files after gather=%s existing_sources=%s",
+            len(files),
+            len(existing_sources),
         )
 
         try:
             settings = self._merge_valves(user_payload)
         except Exception as exc:
-            logger.debug("Failed to merge valves for custom RAG: %s", exc, exc_info=True)
+            logger.debug(
+                "Failed to merge valves for custom RAG: %s", exc, exc_info=True
+            )
             settings = self.valves.model_dump(exclude_unset=True)
 
         debug_mode = self._normalise_debug_mode(settings)
@@ -923,7 +869,13 @@ class Pipe:
                 return None
 
             queries = [query] if query else ["<empty query>"]
-            stats = {"total_documents": 0, "total_chunks": 0, "candidate_model_ids": candidate_model_ids}
+            stats = {
+                "raw_documents": 0,
+                "raw_chunks": 0,
+                "context_documents": 0,
+                "context_chunks": 0,
+                "candidate_model_ids": candidate_model_ids,
+            }
 
             metadata_copy = copy.deepcopy(metadata)
             metadata_copy.setdefault("custom_rag", {})
@@ -931,10 +883,12 @@ class Pipe:
                 {
                     "query": query,
                     "queries": queries,
+                    "stats": stats,
                     "filters": stats,
                     "citation_map": {},
                     "mode": "skipped",
                     "candidate_model_ids": candidate_model_ids,
+                    "handled": True,
                 }
             )
             metadata_copy["files"] = files
@@ -950,16 +904,9 @@ class Pipe:
                 logger.info(debug_summary)
             metadata_copy["custom_rag"]["debug_summary"] = debug_summary
             form_data["metadata"] = metadata_copy
+            form_data.pop("files", None)
 
-            return CustomRagResult(
-                query=query,
-                sources=existing_sources,
-                bundles=[],
-                settings_snapshot=stats,
-                queries=queries,
-                debug_mode=debug_mode,
-                debug_summary=debug_summary,
-            )
+            return None
 
         if not hasattr(request.app.state, "EMBEDDING_FUNCTION"):
             logger.debug("Custom RAG: embedding function unavailable, skipping.")
@@ -978,58 +925,61 @@ class Pipe:
             "full_context": getattr(config, "RAG_FULL_CONTEXT", False),
         }
 
-        needs_fresh_query = not existing_sources
-        if settings.get("collection_allowlist") or settings.get("collection_blocklist"):
-            needs_fresh_query = True
-        if needs_fresh_query and not files:
-            needs_fresh_query = False
-        for key, default_value in default_settings.items():
-            valve_value = settings.get(key)
-            if valve_value is not None and valve_value != default_value:
-                needs_fresh_query = True
-                break
-
-        queries = await self._generate_queries(
-            request,
-            form_data,
-            query,
-            user_model,
+        top_k = self._bounded_neighbor_count(
+            settings.get("top_k"), default_settings["top_k"]
         )
-        if not queries:
-            queries = [query]
+        top_k_reranker = self._bounded_neighbor_count(
+            settings.get("top_k_reranker"),
+            default_settings["top_k_reranker"],
+        )
+        relevance_threshold = (
+            settings.get("relevance_threshold")
+            if settings.get("relevance_threshold") is not None
+            else default_settings["relevance_threshold"]
+        )
+        hybrid_search = (
+            settings.get("hybrid_search")
+            if settings.get("hybrid_search") is not None
+            else default_settings["hybrid_search"]
+        )
+        full_context_pref = (
+            settings.get("full_context")
+            if settings.get("full_context") is not None
+            else default_settings["full_context"]
+        )
+        hybrid_search = bool(hybrid_search)
+        full_context_pref = bool(full_context_pref)
 
-        retrieval_mode = "filtered"
+        all_full_context = bool(files) and all(
+            isinstance(item, dict) and item.get("context") == "full" for item in files
+        )
+        full_context = all_full_context or full_context_pref
+
+        queries: List[str] = []
+        if files and not all_full_context:
+            queries = await self._generate_queries(
+                request,
+                form_data,
+                query,
+                user_model,
+            )
+        if not queries:
+            fallback = (
+                get_last_user_message(form_data.get("messages", [])) or query or ""
+            )
+            queries = [fallback]
+
+        retrieval_mode = "supplied"
         sources = existing_sources
 
-        if needs_fresh_query:
-            filtered_items = self._filter_items_by_collection(files, settings)
-            if not filtered_items:
-                logger.debug("Custom RAG: no items survived collection filters, skipping.")
-                return None
-
-            top_k = settings.get("top_k") or default_settings["top_k"]
-            top_k_reranker = (
-                settings.get("top_k_reranker") or default_settings["top_k_reranker"]
-            )
-            relevance_threshold = settings.get("relevance_threshold")
-            if relevance_threshold is None:
-                relevance_threshold = default_settings["relevance_threshold"]
-
-            hybrid_search = settings.get("hybrid_search")
-            if hybrid_search is None:
-                hybrid_search = default_settings["hybrid_search"]
-
-            full_context = settings.get("full_context")
-            if full_context is None:
-                full_context = default_settings["full_context"]
-
+        if files:
             embedding_function = request.app.state.EMBEDDING_FUNCTION
             reranking_function = request.app.state.RERANKING_FUNCTION
 
             try:
                 sources = get_sources_from_items(
                     request=request,
-                    items=filtered_items,
+                    items=files,
                     queries=queries,
                     embedding_function=lambda texts, prefix=None: embedding_function(
                         texts,
@@ -1040,7 +990,8 @@ class Pipe:
                     reranking_function=(
                         (
                             lambda sentences: reranking_function(
-                                sentences, user=user_model
+                                sentences,
+                                user=user_model,
                             )
                         )
                         if reranking_function
@@ -1053,15 +1004,14 @@ class Pipe:
                     full_context=full_context,
                     user=user_model,
                 )
-                retrieval_mode = "refetched"
+                retrieval_mode = "retrieved"
             except Exception as exc:
                 logger.exception("Custom RAG retrieval failed: %s", exc)
                 return None
 
-        bundles, ui_sources, stats = self._filter_sources(sources, settings)
+        bundles, ui_sources, stats = self._bundle_sources(sources)
         stats["candidate_model_ids"] = candidate_model_ids
-        if not bundles:
-            logger.debug("Custom RAG: no bundles produced after filtering.")
+        stats["mode"] = retrieval_mode
 
         context_str, citation_map = self._render_context(bundles)
         if context_str:
@@ -1078,10 +1028,12 @@ class Pipe:
             {
                 "query": query,
                 "queries": queries,
+                "stats": stats,
                 "filters": stats,
                 "citation_map": citation_map,
                 "mode": retrieval_mode,
                 "candidate_model_ids": candidate_model_ids,
+                "handled": True,
             }
         )
         metadata_copy["files"] = files
@@ -1106,7 +1058,7 @@ class Pipe:
             query=query,
             sources=ui_sources,
             bundles=bundles,
-            settings_snapshot=stats,
+            stats=stats,
             queries=queries,
             debug_mode=debug_mode,
             debug_summary=debug_summary,
@@ -1173,7 +1125,9 @@ class Pipe:
         if not result or result.debug_mode != "chat" or not result.debug_summary:
             return response
 
-        summary = "\n\n---\n" + result.debug_summary if result.debug_summary else ""
+        summary = (
+            f"\n\n---\n{result.debug_summary}\n\n" if result.debug_summary else ""
+        )
 
         if isinstance(response, StreamingResponse):
             original_response = response
@@ -1215,7 +1169,9 @@ class Pipe:
                 if isinstance(message, dict):
                     content = message.get("content", "")
                     message["content"] = (
-                        f"{content}{summary}" if content and summary else content or summary
+                        f"{content}{summary}"
+                        if content and summary
+                        else content or summary
                     )
                     data["choices"][0]["message"] = message
                     return JSONResponse(
@@ -1232,7 +1188,9 @@ class Pipe:
                 if isinstance(message, dict):
                     content = message.get("content", "")
                     message["content"] = (
-                        f"{content}{summary}" if content and summary else content or summary
+                        f"{content}{summary}"
+                        if content and summary
+                        else content or summary
                     )
             return response
 
@@ -1269,7 +1227,9 @@ class Pipe:
         payload.setdefault("name", payload.get("username", "Pipeline User"))
         payload.setdefault("email", payload.get("email") or f"{candidate_id}@local")
         payload.setdefault("role", payload.get("role", "user"))
-        payload.setdefault("profile_image_url", payload.get("profile_image_url", "/user.png"))
+        payload.setdefault(
+            "profile_image_url", payload.get("profile_image_url", "/user.png")
+        )
         now_ts = int(time.time())
         payload.setdefault("last_active_at", now_ts)
         payload.setdefault("updated_at", now_ts)
@@ -1323,7 +1283,11 @@ class Pipe:
                     return value
 
         user_valves = self._extract_user_valves(user_payload)
-        if user_valves and isinstance(user_valves.model_id, str) and user_valves.model_id:
+        if (
+            user_valves
+            and isinstance(user_valves.model_id, str)
+            and user_valves.model_id
+        ):
             return user_valves.model_id
 
         if self.valves.model_id:
@@ -1371,8 +1335,25 @@ class Pipe:
         form_data = copy.deepcopy(body)
         form_data.pop("user", None)
         form_data["model"] = target_model
-        if metadata is not None:
-            form_data["metadata"] = metadata
+        body_metadata = copy.deepcopy(body.get("metadata") or {})
+        merged_metadata = copy.deepcopy(metadata) if metadata else {}
+
+        for key, value in body_metadata.items():
+            if key == "files" and value:
+                merged_list = []
+                merged_list.extend(merged_metadata.get("files") or [])
+                merged_list.extend(value if isinstance(value, list) else [])
+                if merged_list:
+                    merged_metadata["files"] = merged_list
+            elif key == "sources" and value:
+                merged_sources = []
+                merged_sources.extend(merged_metadata.get("sources") or [])
+                merged_sources.extend(value if isinstance(value, list) else [])
+                merged_metadata["sources"] = merged_sources
+            else:
+                merged_metadata.setdefault(key, value)
+
+        form_data["metadata"] = merged_metadata
         return form_data
 
     async def pipe(
@@ -1383,6 +1364,7 @@ class Pipe:
         __metadata__: Optional[Dict[str, Any]] = None,
         __model__: Optional[Dict[str, Any]] = None,
         __event_emitter__=None,
+        __files__=None,
         **kwargs,
     ):
         if __request__ is None:
@@ -1397,22 +1379,26 @@ class Pipe:
             __request__,
         )
         form_data = self._prepare_form_data(body, __metadata__, target_model)
-
-        selected_model_id = body.get("model")
-        pipeline_entry: Dict[str, Any] = {}
-        if isinstance(selected_model_id, str):
-            lookup_id = selected_model_id.split(".", 1)[0]
-            pipeline_entry = __request__.app.state.MODELS.get(lookup_id, {})
+        metadata_for_debug = form_data.get("metadata") or {}
+        logger.debug(
+            "Custom RAG: pipe entry metadata files=%s sources=%s external_files=%s",
+            len(metadata_for_debug.get("files") or []),
+            len(metadata_for_debug.get("sources") or []),
+            len(__files__ or []),
+        )
 
         metadata_blob = form_data.get("metadata", {}) or {}
         metadata_model = metadata_blob.get("model")
+
+        pipeline_model_id = body.get("model")
+        selected_model_id = pipeline_model_id
+        model_entry: Dict[str, Any] = {}
+        if isinstance(pipeline_model_id, str):
+            lookup_id = pipeline_model_id.split(".", 1)[0]
+            model_entry = __request__.app.state.MODELS.get(lookup_id, {})
+
         if isinstance(metadata_model, dict) and metadata_model:
-            pipeline_entry = metadata_model
-            consider_base_id = metadata_model.get("base_model_id")
-            if isinstance(consider_base_id, str) and consider_base_id:
-                selected_model_id = consider_base_id
-        elif not pipeline_entry and isinstance(__model__, dict):
-            pipeline_entry = __model__
+            model_entry = metadata_model
 
         custom_rag_result = None
         try:
@@ -1422,7 +1408,9 @@ class Pipe:
                 user_model,
                 __user__,
                 selected_model_id,
-                pipeline_entry,
+                model_entry,
+                target_model,
+                __files__,
             )
         except Exception as exc:
             logger.exception("Custom RAG pipeline failed: %s", exc)
